@@ -1,8 +1,8 @@
 
 """
-Perovskite Structure Prediction using Dimensional Symbolic Regression with MPI
+Perovskite Structure Prediction using Symbolic Regression with gplearn and MPI
 
-This script uses dimensional symbolic regression to predict whether a compound
+This script uses gplearn symbolic regression to predict whether a compound
 will form a perovskite structure based on ionic radii and oxidation states.
 
 To run with MPI parallelization:
@@ -19,11 +19,10 @@ from sklearn.metrics import accuracy_score, classification_report
 from sklearn.utils import resample
 from datetime import datetime
 import os
-
-# Add current directory to path for custom modules
-sys.path.append('.')
-from customsr_v2 import DimensionalSymbolicRegressor, Dimension
-import ldspfeliciano
+from gplearn.genetic import SymbolicRegressor
+from sklearn.metrics import mean_squared_error
+import warnings
+warnings.filterwarnings('ignore')
 
 # For MPI support
 try:
@@ -50,14 +49,23 @@ NON_PEROVSKITE_DATA_FILE = 'Database_S1.2_with_radii.csv'
 N_FOLDS = 5
 RANDOM_STATE = 42
 
-# Symbolic regression hyperparameters - adjusted for MPI
-SR_POPULATION_SIZE = 15000 * size if HAS_MPI else 15000  # Scale with number of processes
-SR_GENERATIONS = 5000  # Reduced for faster testing with MPI
-SR_MUTATION_RATE = 0.15
-SR_CROSSOVER_RATE = 0.7
-SR_MAX_DEPTH = 5
-SR_TOURNAMENT_SIZE = 3
-SR_FITNESS_THRESHOLD = 0.1
+# Symbolic regression hyperparameters - gplearn parameters
+SR_POPULATION_SIZE = 5000  # Population size for genetic programming
+SR_GENERATIONS = 20  # Number of generations
+SR_TOURNAMENT_SIZE = 20  # Tournament size for selection
+SR_CONST_RANGE = (-1.0, 1.0)  # Range for random constants
+SR_INIT_DEPTH = (2, 6)  # Initial depth range for trees
+SR_INIT_METHOD = 'half and half'  # Initialization method
+SR_FUNCTION_SET = ('add', 'sub', 'mul', 'div', 'sqrt', 'log', 'abs', 'neg', 'inv', 'max', 'min')
+SR_PARSIMONY_COEFFICIENT = 0.001  # Parsimony coefficient to control complexity
+SR_P_CROSSOVER = 0.7  # Probability of crossover
+SR_P_SUBTREE_MUTATION = 0.1  # Probability of subtree mutation
+SR_P_HOIST_MUTATION = 0.05  # Probability of hoist mutation
+SR_P_POINT_MUTATION = 0.1  # Probability of point mutation
+SR_MAX_SAMPLES = 0.9  # Fraction of samples to use for training each individual
+SR_VERBOSE = 1  # Verbosity level
+SR_RANDOM_STATE = 42  # Random state for reproducibility
+SR_N_JOBS = 1  # Number of parallel jobs (set to 1 for MPI compatibility)
 
 # Prediction threshold
 PREDICTION_THRESHOLD = 0.5
@@ -74,7 +82,7 @@ SUMMARY_FILE = f'perovskite_sr_summary_{TIMESTAMP}.csv'
 
 def ensure_output_dir():
     """Create output directory if it doesn't exist."""
-    if not os.path.exists(OUTPUT_DIR):
+    if rank == 0 and not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
         
 def load_and_examine_data():
@@ -126,21 +134,26 @@ def prepare_combined_dataset(known_perovskites, known_non_perovskites):
 
 def clean_and_balance_data(combined_data):
     """Clean missing data and balance the dataset."""
-    print("\nCleaning and balancing data...")
+    if rank == 0:
+        print("\nCleaning and balancing data...")
     
     # Check available columns
     radii_cols = ['A Radius', 'B Radius', "B' Radius", 'X Radius']
     available_radii = [col for col in radii_cols if col in combined_data.columns]
-    print(f"Available radius columns: {available_radii}")
+    if rank == 0:
+        print(f"Available radius columns: {available_radii}")
     
     oxidation_cols = [col for col in combined_data.columns if 'Oxidation State' in col]
-    print(f"Available oxidation state columns: {oxidation_cols}")
+    if rank == 0:
+        print(f"Available oxidation state columns: {oxidation_cols}")
     
     # Remove rows with missing radius data
-    print(f"Before removing missing data: {len(combined_data)} samples")
+    if rank == 0:
+        print(f"Before removing missing data: {len(combined_data)} samples")
     for col in available_radii:
         combined_data = combined_data.dropna(subset=[col])
-    print(f"After removing missing radius data: {len(combined_data)} samples")
+    if rank == 0:
+        print(f"After removing missing radius data: {len(combined_data)} samples")
     
     # Balance the dataset
     perovskite_samples = combined_data[combined_data['is_perovskite'] == 1]
@@ -169,17 +182,19 @@ def clean_and_balance_data(combined_data):
         perovskite_samples_bal = perovskite_samples
         non_perovskite_samples_bal = non_perovskite_samples
     
-    balanced_data = pd.concat([perovskite_samples_bal, non_perovskite_samples_bal], ignore_index=True)
+    balanced_data = pd.concat([perovskite_samples_bal, non_perovskite_samples_bal], ignore_index=True)  # type: ignore
     
-    print(f"Balanced dataset shape: {balanced_data.shape}")
-    print(f"Perovskites: {sum(balanced_data['is_perovskite'] == 1)}")
-    print(f"Non-perovskites: {sum(balanced_data['is_perovskite'] == 0)}")
+    if rank == 0:
+        print(f"Balanced dataset shape: {balanced_data.shape}")
+        print(f"Perovskites: {sum(balanced_data['is_perovskite'] == 1)}")
+        print(f"Non-perovskites: {sum(balanced_data['is_perovskite'] == 0)}")
     
     return balanced_data
 
 def prepare_features(balanced_data):
     """Prepare feature matrix and labels."""
-    print("\nPreparing features...")
+    if rank == 0:
+        print("\nPreparing features...")
     
     features = []
     feature_names = []
@@ -207,23 +222,17 @@ def prepare_features(balanced_data):
     X = np.column_stack(features)
     y = balanced_data['is_perovskite'].values
     
-    print(f"Feature matrix shape: {X.shape}")
-    print(f"Feature names: {feature_names}")
-    print(f"Target distribution: {np.bincount(y)}")
+    if rank == 0:
+        print(f"Feature matrix shape: {X.shape}")
+        print(f"Feature names: {feature_names}")
+        print(f"Target distribution: {np.bincount(y)}")
     
-    # Define feature dimensions
-    feature_dimensions = []
-    for name in feature_names:
-        if 'radius' in name:
-            feature_dimensions.append(Dimension(length=1))  # Length dimension
-        else:
-            feature_dimensions.append(Dimension(length=0))  # Dimensionless
-    
-    return X, y, feature_names, feature_dimensions
+    return X, y, feature_names
 
-def run_cross_validation(X, y, feature_names, feature_dimensions):
+def run_cross_validation(X, y, feature_names):
     """Run stratified k-fold cross-validation."""
-    print(f"\nRunning {N_FOLDS}-fold cross-validation...")
+    if rank == 0:
+        print(f"\nRunning {N_FOLDS}-fold cross-validation...")
     
     skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
     
@@ -232,7 +241,8 @@ def run_cross_validation(X, y, feature_names, feature_dimensions):
     cv_test_accuracies = []
     
     for fold, (train_idx, test_idx) in enumerate(skf.split(X, y), 1):
-        print(f"\nProcessing Fold {fold}...")
+        if rank == 0:
+            print(f"\nProcessing Fold {fold}...")
         
         X_train, X_test = X[train_idx], X[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
@@ -254,15 +264,24 @@ def run_cross_validation(X, y, feature_names, feature_dimensions):
         X_train_bal = X_train[balanced_idx]
         y_train_bal = y_train[balanced_idx]
         
-        # Train regressor on balanced training set
-        regressor = DimensionalSymbolicRegressor(
+        # Train gplearn symbolic regressor on balanced training set
+        regressor = SymbolicRegressor(
             population_size=SR_POPULATION_SIZE,
             generations=SR_GENERATIONS,
-            mutation_rate=SR_MUTATION_RATE,
-            crossover_rate=SR_CROSSOVER_RATE,
-            max_depth=SR_MAX_DEPTH,
             tournament_size=SR_TOURNAMENT_SIZE,
-            fitness_threshold=SR_FITNESS_THRESHOLD
+            const_range=SR_CONST_RANGE,
+            init_depth=SR_INIT_DEPTH,
+            init_method=SR_INIT_METHOD,
+            function_set=SR_FUNCTION_SET,
+            parsimony_coefficient=SR_PARSIMONY_COEFFICIENT,
+            p_crossover=SR_P_CROSSOVER,
+            p_subtree_mutation=SR_P_SUBTREE_MUTATION,
+            p_hoist_mutation=SR_P_HOIST_MUTATION,
+            p_point_mutation=SR_P_POINT_MUTATION,
+            max_samples=SR_MAX_SAMPLES,
+            verbose=SR_VERBOSE,
+            random_state=SR_RANDOM_STATE + rank,  # Different seed for each MPI process
+            n_jobs=SR_N_JOBS
         )
         
         regressor.fit(X_train_bal, y_train_bal)
@@ -279,20 +298,22 @@ def run_cross_validation(X, y, feature_names, feature_dimensions):
         cv_train_accuracies.append(train_acc)
         cv_test_accuracies.append(test_acc)
         
-        print(f"  Train Accuracy (balanced): {train_acc:.4f}")
-        print(f"  Test Accuracy (original): {test_acc:.4f}")
+        if rank == 0:
+            print(f"  Train Accuracy (balanced): {train_acc:.4f}")
+            print(f"  Test Accuracy (original): {test_acc:.4f}")
+            print(f"  Best program: {regressor._program}")
         
         # Generate classification report
         report = classification_report(
             y_test, y_test_pred_binary, 
             target_names=['Non-Perovskite', 'Perovskite'],
             output_dict=True
-        )
+        )  # type: ignore
         
         # Store results for this fold
         fold_result = {
             'fold': fold,
-            'best_individual': str(regressor.best_individual),
+            'best_individual': str(regressor._program),
             'train_accuracy': train_acc,
             'test_accuracy': test_acc,
             'precision_non_perovskite': report['Non-Perovskite']['precision'],
@@ -310,13 +331,15 @@ def run_cross_validation(X, y, feature_names, feature_dimensions):
         }
         results.append(fold_result)
         
-        print("-" * 50)
+        if rank == 0:
+            print("-" * 50)
     
     return results, cv_train_accuracies, cv_test_accuracies
 
 def save_results(results, cv_train_accuracies, cv_test_accuracies, feature_names):
     """Save all results to CSV files."""
-    print("\nSaving results...")
+    if rank == 0:
+        print("\nSaving results...")
     
     ensure_output_dir()
     
@@ -324,7 +347,8 @@ def save_results(results, cv_train_accuracies, cv_test_accuracies, feature_names
     results_df = pd.DataFrame(results)
     results_path = os.path.join(OUTPUT_DIR, RESULTS_FILE)
     results_df.to_csv(results_path, index=False)
-    print(f"Detailed results saved to: {results_path}")
+    if rank == 0:
+        print(f"Detailed results saved to: {results_path}")
     
     # Create and save summary statistics
     summary_stats = {
@@ -354,13 +378,13 @@ def save_results(results, cv_train_accuracies, cv_test_accuracies, feature_names
     config_info = {
         'metric': [
             'n_folds', 'random_state', 'population_size', 'generations',
-            'mutation_rate', 'crossover_rate', 'max_depth', 'tournament_size',
-            'fitness_threshold', 'prediction_threshold', 'feature_names'
+            'tournament_size', 'parsimony_coefficient', 'p_crossover', 'p_subtree_mutation',
+            'p_hoist_mutation', 'p_point_mutation', 'prediction_threshold', 'feature_names'
         ],
         'value': [
             N_FOLDS, RANDOM_STATE, SR_POPULATION_SIZE, SR_GENERATIONS,
-            SR_MUTATION_RATE, SR_CROSSOVER_RATE, SR_MAX_DEPTH, SR_TOURNAMENT_SIZE,
-            SR_FITNESS_THRESHOLD, PREDICTION_THRESHOLD, ', '.join(feature_names)
+            SR_TOURNAMENT_SIZE, SR_PARSIMONY_COEFFICIENT, SR_P_CROSSOVER, SR_P_SUBTREE_MUTATION,
+            SR_P_HOIST_MUTATION, SR_P_POINT_MUTATION, PREDICTION_THRESHOLD, ', '.join(feature_names)
         ]
     }
     
@@ -373,7 +397,8 @@ def save_results(results, cv_train_accuracies, cv_test_accuracies, feature_names
     summary_df = pd.DataFrame(summary_data)
     summary_path = os.path.join(OUTPUT_DIR, SUMMARY_FILE)
     summary_df.to_csv(summary_path, index=False)
-    print(f"Summary statistics saved to: {summary_path}")
+    if rank == 0:
+        print(f"Summary statistics saved to: {summary_path}")
     
     return results_df, summary_df
 
@@ -393,8 +418,8 @@ def print_final_summary(cv_train_accuracies, cv_test_accuracies):
 def main():
     """Main execution function."""
     if rank == 0:
-        print("Perovskite Structure Prediction using Dimensional Symbolic Regression with MPI")
-        print("="*70)
+        print("Perovskite Structure Prediction using gplearn Symbolic Regression with MPI")
+        print("="*75)
         if HAS_MPI:
             print(f"Running with MPI: {size} processes")
         else:
@@ -412,11 +437,11 @@ def main():
     balanced_data = clean_and_balance_data(combined_data)
     
     # Prepare features
-    X, y, feature_names, feature_dimensions = prepare_features(balanced_data)
+    X, y, feature_names = prepare_features(balanced_data)
     
     # Run cross-validation
     results, cv_train_accuracies, cv_test_accuracies = run_cross_validation(
-        X, y, feature_names, feature_dimensions
+        X, y, feature_names
     )
     
     # Save results (only on root process)
