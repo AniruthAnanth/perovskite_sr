@@ -1,9 +1,14 @@
 
 """
-Perovskite Structure Prediction using Dimensional Symbolic Regression
+Perovskite Structure Prediction using Dimensional Symbolic Regression with MPI
 
 This script uses dimensional symbolic regression to predict whether a compound
 will form a perovskite structure based on ionic radii and oxidation states.
+
+To run with MPI parallelization:
+    mpiexec -n 4 python main.py
+
+Where 4 is the number of processes to use.
 """
 
 import sys
@@ -20,6 +25,19 @@ sys.path.append('.')
 from customsr_v2 import DimensionalSymbolicRegressor, Dimension
 import ldspfeliciano
 
+# For MPI support
+try:
+    from mpi4py import MPI
+    HAS_MPI = True
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+except ImportError:
+    HAS_MPI = False
+    rank = 0
+    size = 1
+    print("Warning: mpi4py not available. Running in serial mode.")
+
 # ============================================================================
 # HYPERPARAMETERS AND CONFIGURATION
 # ============================================================================
@@ -32,9 +50,9 @@ NON_PEROVSKITE_DATA_FILE = 'Database_S1.2_with_radii.csv'
 N_FOLDS = 5
 RANDOM_STATE = 42
 
-# Symbolic regression hyperparameters
-SR_POPULATION_SIZE = 10
-SR_GENERATIONS = 200
+# Symbolic regression hyperparameters - adjusted for MPI
+SR_POPULATION_SIZE = 15000 * size if HAS_MPI else 15000  # Scale with number of processes
+SR_GENERATIONS = 5000  # Reduced for faster testing with MPI
 SR_MUTATION_RATE = 0.15
 SR_CROSSOVER_RATE = 0.7
 SR_MAX_DEPTH = 5
@@ -61,30 +79,33 @@ def ensure_output_dir():
         
 def load_and_examine_data():
     """Load and examine the perovskite datasets."""
-    print("Loading datasets...")
+    if rank == 0:
+        print("Loading datasets...")
     known_perovskites = pd.read_csv(PEROVSKITE_DATA_FILE)
     known_non_perovskites = pd.read_csv(NON_PEROVSKITE_DATA_FILE)
     
-    print(f"Known Perovskites shape: {known_perovskites.shape}")
-    print(f"Known Non-Perovskites shape: {known_non_perovskites.shape}")
-    
-    print(f"\nKnown Perovskites columns: {known_perovskites.columns.tolist()}")
-    
-    # Check radius column statistics
-    radii_cols = ['A Radius', 'B Radius', "B' Radius", 'X Radius']
-    print(f"\nRadii columns statistics:")
-    for col in radii_cols:
-        if col in known_perovskites.columns:
-            non_null_count = known_perovskites[col].notna().sum()
-            total_count = len(known_perovskites)
-            print(f"  {col}: {non_null_count}/{total_count} non-null values")
+    if rank == 0:
+        print(f"Known Perovskites shape: {known_perovskites.shape}")
+        print(f"Known Non-Perovskites shape: {known_non_perovskites.shape}")
+        
+        print(f"\nKnown Perovskites columns: {known_perovskites.columns.tolist()}")
+        
+        # Check radius column statistics
+        radii_cols = ['A Radius', 'B Radius', "B' Radius", 'X Radius']
+        print(f"\nRadii columns statistics:")
+        for col in radii_cols:
+            if col in known_perovskites.columns:
+                non_null_count = known_perovskites[col].notna().sum()
+                total_count = len(known_perovskites)
+                print(f"  {col}: {non_null_count}/{total_count} non-null values")
     
     return known_perovskites, known_non_perovskites
 
 
 def prepare_combined_dataset(known_perovskites, known_non_perovskites):
     """Prepare and combine perovskite and non-perovskite datasets."""
-    print("\nPreparing combined dataset...")
+    if rank == 0:
+        print("\nPreparing combined dataset...")
     
     # Add labels
     perovskite_data = known_perovskites.copy()
@@ -96,9 +117,10 @@ def prepare_combined_dataset(known_perovskites, known_non_perovskites):
     # Combine datasets
     combined_data = pd.concat([perovskite_data, non_perovskite_data], ignore_index=True)
     
-    print(f"Combined dataset shape: {combined_data.shape}")
-    print(f"Perovskites: {sum(combined_data['is_perovskite'] == 1)}")
-    print(f"Non-perovskites: {sum(combined_data['is_perovskite'] == 0)}")
+    if rank == 0:
+        print(f"Combined dataset shape: {combined_data.shape}")
+        print(f"Perovskites: {sum(combined_data['is_perovskite'] == 1)}")
+        print(f"Non-perovskites: {sum(combined_data['is_perovskite'] == 0)}")
     
     return combined_data
 
@@ -370,8 +392,15 @@ def print_final_summary(cv_train_accuracies, cv_test_accuracies):
 
 def main():
     """Main execution function."""
-    print("Perovskite Structure Prediction using Dimensional Symbolic Regression")
-    print("="*70)
+    if rank == 0:
+        print("Perovskite Structure Prediction using Dimensional Symbolic Regression with MPI")
+        print("="*70)
+        if HAS_MPI:
+            print(f"Running with MPI: {size} processes")
+        else:
+            print("Running in serial mode (MPI not available)")
+        print(f"Population size: {SR_POPULATION_SIZE}")
+        print(f"Generations: {SR_GENERATIONS}")
     
     # Load and examine data
     known_perovskites, known_non_perovskites = load_and_examine_data()
@@ -390,13 +419,15 @@ def main():
         X, y, feature_names, feature_dimensions
     )
     
-    # Save results
-    results_df, summary_df = save_results(
-        results, cv_train_accuracies, cv_test_accuracies, feature_names
-    )
+    # Save results (only on root process)
+    if rank == 0:
+        results_df, summary_df = save_results(
+            results, cv_train_accuracies, cv_test_accuracies, feature_names
+        )
     
     # Print final summary
-    print_final_summary(cv_train_accuracies, cv_test_accuracies)
+    if rank == 0:
+        print_final_summary(cv_train_accuracies, cv_test_accuracies)
 
 if __name__ == "__main__":
     main()

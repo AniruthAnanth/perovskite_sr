@@ -4,6 +4,7 @@ import copy
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Union, Any
 from sklearn.linear_model import LinearRegression
+from mpi4py import MPI
 
 
 @dataclass
@@ -409,7 +410,7 @@ class DimensionalSymbolicRegressor:
     Genetic Programming-based Symbolic Regressor with dimensional analysis.
     
     This regressor evolves mathematical expressions that respect physical dimensions
-    and uses linear regression to optimize coefficients.
+    and uses linear regression to optimize coefficients. Now with MPI parallelization.
     """
     
     def __init__(self, 
@@ -432,7 +433,19 @@ class DimensionalSymbolicRegressor:
             tournament_size: Size of tournament for selection
             fitness_threshold: Early stopping threshold (optional)
         """
+        # MPI setup
+        self.comm = MPI.COMM_WORLD
+        self.rank = self.comm.Get_rank()
+        self.size = self.comm.Get_size()
+        
+        # Ensure population size is divisible by number of processes for even distribution
+        if population_size % self.size != 0:
+            population_size = ((population_size // self.size) + 1) * self.size
+            if self.rank == 0:
+                print(f"Adjusted population size to {population_size} for even MPI distribution")
+        
         self.population_size: int = population_size
+        self.local_population_size: int = population_size // self.size
         self.generations: int = generations
         self.mutation_rate: float = mutation_rate
         self.crossover_rate: float = crossover_rate
@@ -441,6 +454,7 @@ class DimensionalSymbolicRegressor:
         self.fitness_threshold: Optional[float] = fitness_threshold
         
         self.population: List[Node] = []
+        self.local_population: List[Node] = []
         self.best_individual: Optional[OptimizedExpression] = None
         
         # Define variable dimensions for perovskite tolerance factor prediction
@@ -455,6 +469,10 @@ class DimensionalSymbolicRegressor:
         }
         self.variable_names: List[str] = list(self.variable_dims.keys())
         self.target_dimension: Dimension = Dimension(0)  # tolerance factor is dimensionless
+        
+        # Seed random number generator differently for each process
+        random.seed(42 + self.rank)
+        np.random.seed(42 + self.rank)
     
     def create_random_tree(self, max_depth: int) -> Node:
         """
@@ -670,6 +688,71 @@ class DimensionalSymbolicRegressor:
             
         except Exception:
             return float('inf')
+
+    def fitness_parallel(self, individuals: List[Node], X: np.ndarray, y: np.ndarray) -> List[float]:
+        """
+        Calculate fitness scores for multiple individuals in parallel.
+        
+        Args:
+            individuals: List of expression trees to evaluate
+            X: Input data matrix
+            y: Target values
+            
+        Returns:
+            List of fitness scores (lower is better)
+        """
+        local_fitnesses = []
+        for individual in individuals:
+            local_fitnesses.append(self.fitness(individual, X, y))
+        return local_fitnesses
+    
+    def gather_best_individuals(self, local_population: List[Node], local_fitnesses: List[float], X: np.ndarray, y: np.ndarray) -> Tuple[Optional[Node], float]:
+        """
+        Gather best individuals from all processes and return global best.
+        
+        Args:
+            local_population: Local population on this process
+            local_fitnesses: Local fitness scores
+            X: Input data matrix
+            y: Target values
+            
+        Returns:
+            Tuple of (best_individual, best_fitness) - individual may be None on non-root processes
+        """
+        # Find local best
+        local_best_fitness = min(local_fitnesses)
+        local_best_idx = local_fitnesses.index(local_best_fitness)
+        local_best_individual = local_population[local_best_idx]
+        
+        # Gather all local best individuals and fitnesses
+        all_local_bests = self.comm.gather((local_best_individual, local_best_fitness), root=0)
+        
+        if self.rank == 0:
+            # Find global best on root process
+            global_best_fitness = float('inf')
+            global_best_individual = None
+            
+            if all_local_bests is not None:
+                for individual, fitness in all_local_bests:
+                    if fitness < global_best_fitness:
+                        global_best_fitness = fitness
+                        global_best_individual = individual
+            
+            return global_best_individual, global_best_fitness
+        else:
+            return None, float('inf')
+    
+    def broadcast_best_individual(self, best_individual: Optional[Node]) -> Optional[Node]:
+        """
+        Broadcast the best individual from root to all processes.
+        
+        Args:
+            best_individual: Best individual (only valid on root process)
+            
+        Returns:
+            Best individual (broadcasted to all processes)
+        """
+        return self.comm.bcast(best_individual, root=0)
     
     def tournament_selection(self, fitnesses: List[float]) -> int:
         """
@@ -719,7 +802,7 @@ class DimensionalSymbolicRegressor:
     
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
         """
-        Fit the symbolic regressor to training data.
+        Fit the symbolic regressor to training data using MPI parallelization.
         
         Args:
             X: Input features matrix of shape (n_samples, n_features)
@@ -729,56 +812,68 @@ class DimensionalSymbolicRegressor:
         if X.shape[1] != len(self.variable_names):
             raise ValueError(f"Expected {len(self.variable_names)} features, got {X.shape[1]}")
         
-        # Initialize population
-        self.population = []
-        for _ in range(self.population_size):
+        # Initialize local population on each process
+        self.local_population = []
+        for _ in range(self.local_population_size):
             individual: Node = self.create_random_tree(self.max_depth)
-            self.population.append(individual)
+            self.local_population.append(individual)
         
         best_fitness: float = float('inf')
+        global_best_individual: Optional[Node] = None
         
-        print(f"Starting evolution with {self.population_size} individuals for {self.generations} generations")
+        if self.rank == 0:
+            print(f"Starting MPI evolution with {self.population_size} individuals ({self.local_population_size} per process)")
+            print(f"Running for {self.generations} generations on {self.size} processes")
         
         for generation in range(self.generations):
-            # Evaluate fitness for all individuals
-            fitnesses: List[float] = [self.fitness(ind, X, y) for ind in self.population]
+            # Evaluate fitness for local population in parallel
+            local_fitnesses: List[float] = self.fitness_parallel(self.local_population, X, y)
             
-            # Track best individual
-            min_fitness: float = min(fitnesses)
-            if min_fitness < best_fitness:
-                best_fitness = min_fitness
-                best_idx: int = fitnesses.index(min_fitness)
-                best_expr: Node = self.population[best_idx]
-                # Store optimized version of best expression
-                self.best_individual = self.optimize_coefficients(best_expr, X, y)
+            # Find global best across all processes
+            global_best_individual, global_best_fitness = self.gather_best_individuals(
+                self.local_population, local_fitnesses, X, y
+            )
             
-            # Progress reporting
-            print(f"Generation {generation:3d}: Best fitness = {best_fitness:.6f}")
-            if self.best_individual:
-                var_count: int = self.count_variables(self.best_individual.expression)
-                print(f"  Best expression: {self.best_individual} (Variables: {var_count})")
+            # Broadcast global best to all processes
+            global_best_individual = self.broadcast_best_individual(global_best_individual)
+            global_best_fitness = self.comm.bcast(global_best_fitness, root=0)
+            
+            # Update best individual if improved
+            if global_best_fitness < best_fitness:
+                best_fitness = global_best_fitness
+                if global_best_individual is not None:
+                    # Store optimized version of best expression
+                    self.best_individual = self.optimize_coefficients(global_best_individual, X, y)
+            
+            # Progress reporting (only on root process)
+            if self.rank == 0:
+                print(f"Generation {generation:3d}: Best fitness = {best_fitness:.6f}")
+                if self.best_individual:
+                    var_count: int = self.count_variables(self.best_individual.expression)
+                    print(f"  Best expression: {self.best_individual} (Variables: {var_count})")
             
             # Check for early stopping
             if self.fitness_threshold is not None and best_fitness <= self.fitness_threshold:
-                print(f"Early stopping at generation {generation}: "
-                      f"fitness {best_fitness:.6f} <= threshold {self.fitness_threshold}")
+                if self.rank == 0:
+                    print(f"Early stopping at generation {generation}: "
+                          f"fitness {best_fitness:.6f} <= threshold {self.fitness_threshold}")
                 break
             
-            # Create new population through evolution
-            new_population: List[Node] = []
+            # Create new local population through evolution
+            new_local_population: List[Node] = []
             
-            # Elitism: keep best individual's expression structure
-            if self.best_individual is not None:
-                new_population.append(copy.deepcopy(self.best_individual.expression))
+            # Elitism: include global best in local population on all processes
+            if global_best_individual is not None:
+                new_local_population.append(copy.deepcopy(global_best_individual))
             
-            # Generate rest of population through selection, crossover, and mutation
-            while len(new_population) < self.population_size:
-                # Selection
-                parent1_idx: int = self.tournament_selection(fitnesses)
-                parent2_idx: int = self.tournament_selection(fitnesses)
+            # Generate rest of local population through selection, crossover, and mutation
+            while len(new_local_population) < self.local_population_size:
+                # Local tournament selection
+                parent1_idx: int = self.tournament_selection(local_fitnesses)
+                parent2_idx: int = self.tournament_selection(local_fitnesses)
                 
-                parent1: Node = self.population[parent1_idx]
-                parent2: Node = self.population[parent2_idx]
+                parent1: Node = self.local_population[parent1_idx]
+                parent2: Node = self.local_population[parent2_idx]
                 
                 # Crossover
                 if random.random() < self.crossover_rate:
@@ -790,16 +885,55 @@ class DimensionalSymbolicRegressor:
                 child1 = self.mutate(child1)
                 child2 = self.mutate(child2)
                 
-                new_population.extend([child1, child2])
+                new_local_population.extend([child1, child2])
             
-            # Ensure exact population size
-            self.population = new_population[:self.population_size]
+            # Ensure exact local population size
+            self.local_population = new_local_population[:self.local_population_size]
+            
+            # Periodic migration between processes for diversity
+            if generation % 10 == 0 and generation > 0:
+                self.migrate_individuals()
         
-        print(f"\nEvolution completed!")
-        print(f"Final best fitness: {best_fitness:.6f}")
-        if self.best_individual:
-            var_count = self.count_variables(self.best_individual.expression)
-            print(f"Final best expression: {self.best_individual} (Variables: {var_count})")
+        # Synchronize final best individual across all processes
+        if self.rank == 0:
+            print(f"\nEvolution completed!")
+            print(f"Final best fitness: {best_fitness:.6f}")
+            if self.best_individual:
+                var_count = self.count_variables(self.best_individual.expression)
+                print(f"Final best expression: {self.best_individual} (Variables: {var_count})")
+        
+        # Ensure all processes have the final best individual
+        self.best_individual = self.comm.bcast(self.best_individual, root=0)
+    
+    def migrate_individuals(self) -> None:
+        """
+        Migrate individuals between processes to maintain diversity.
+        Each process sends its best individual to the next process.
+        """
+        if self.size <= 1:
+            return
+        
+        # Get local best individual
+        local_fitnesses = [self.fitness(ind, np.zeros((1, len(self.variable_names))), np.zeros(1)) 
+                          for ind in self.local_population]
+        local_best_idx = local_fitnesses.index(min(local_fitnesses))
+        local_best = self.local_population[local_best_idx]
+        
+        # Determine source and destination processes
+        source = (self.rank - 1) % self.size
+        dest = (self.rank + 1) % self.size
+        
+        # Send best individual to next process, receive from previous
+        if self.rank % 2 == 0:  # Even ranks send first
+            self.comm.send(local_best, dest=dest)
+            received_individual = self.comm.recv(source=source)
+        else:  # Odd ranks receive first
+            received_individual = self.comm.recv(source=source)
+            self.comm.send(local_best, dest=dest)
+        
+        # Replace worst individual with received individual
+        worst_idx = local_fitnesses.index(max(local_fitnesses))
+        self.local_population[worst_idx] = received_individual
     
     def predict(self, X: np.ndarray) -> np.ndarray:
         """
